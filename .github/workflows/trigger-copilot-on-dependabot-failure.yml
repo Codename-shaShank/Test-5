@@ -1,0 +1,669 @@
+name: trigger-copilot-on-dependabot-failure
+
+on:
+  workflow_run:
+    workflows: ["Tests"]
+    types: [completed, requested]
+
+# ──────────────────────────────────────────────────────────────
+# Least-privilege permissions — all API calls use GH_PAT_FOR_COPILOT
+# ──────────────────────────────────────────────────────────────
+permissions: {}
+
+# ──────────────────────────────────────────────────────────────
+# Max retry iterations before giving up (prevents infinite loops)
+# ──────────────────────────────────────────────────────────────
+env:
+  MAX_COPILOT_RETRIES: "5"
+  RETRY_LABEL: "copilot-fix-attempt"
+  COPILOT_MARKER: "<!-- copilot-fix-attempt -->"
+  COPILOT_PROGRESS_MARKER: "<!-- copilot-fix-progress -->"
+  MAX_REACHED_MARKER: "<!-- copilot-fix-max-reached -->"
+
+# ──────────────────────────────────────────────────────────────
+# Prevent parallel runs for the same Dependabot branch
+# ──────────────────────────────────────────────────────────────
+concurrency:
+  group: copilot-fix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  approve-current-action-required-run:
+    # Approve trusted pull_request workflow runs immediately when they require approval.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.status == 'action_required' &&
+      github.event.workflow_run.actor.login == 'github-copilot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Approve current action_required run
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ACTOR: ${{ github.event.workflow_run.actor.login }}
+        run: |
+          set -euo pipefail
+
+          echo "✅ Approving action_required run ${RUN_ID} for trusted actor ${ACTOR}"
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/approve" --method POST
+
+  trigger-copilot:
+    # Only when the Tests workflow FAILED on a Dependabot PR branch
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── Step 1: Resolve the PR number ─────────────────────────
+      - name: Resolve PR number
+        id: find_pr
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER=$(gh api "repos/${REPO}/pulls" \
+            --method GET \
+            -f head="${REPO%%/*}:${BRANCH}" \
+            -f state=open \
+            --jq '.[0].number // empty')
+
+          if [[ -z "${PR_NUMBER:-}" ]]; then
+            echo "⚠️  No open PR found for branch ${BRANCH}. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "✅ Found PR #${PR_NUMBER}"
+
+      # ── Step 2: Count previous Copilot attempts ───────────────
+      - name: Count previous attempts
+        if: steps.find_pr.outputs.skip != 'true'
+        id: count
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Paginate all comments to get an accurate count
+          ATTEMPT_COUNT=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"$COPILOT_MARKER\"))] | length" \
+            | paste -sd+ - | bc)
+
+          ATTEMPT_COUNT=$(( ATTEMPT_COUNT + 1 ))
+          echo "attempt=${ATTEMPT_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "📊 Copilot fix attempt #${ATTEMPT_COUNT} (max: ${MAX_COPILOT_RETRIES})"
+
+      # ── Step 3: Gate on retry limit ───────────────────────────
+      - name: Check retry limit
+        if: steps.find_pr.outputs.skip != 'true'
+        id: check_limit
+        env:
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${ATTEMPT}" -gt "${MAX_COPILOT_RETRIES}" ]]; then
+            echo "🛑 Max retries (${MAX_COPILOT_RETRIES}) exceeded. Stopping."
+            echo "exceeded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exceeded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Step 4: Post max-retry notice (idempotent) ────────────
+      - name: Post max-retry notice
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          # Skip if we already posted a max-reached notice
+          EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"$MAX_REACHED_MARKER\"))] | length" \
+            | paste -sd+ - | bc)
+
+          if [[ "${EXISTING}" -gt 0 ]]; then
+            echo "ℹ️  Max-reached notice already posted. Skipping duplicate."
+            exit 0
+          fi
+
+          cat > /tmp/max_reached_body.md <<BODY
+          ${MAX_REACHED_MARKER}
+          ## 🛑 Automated fix limit reached
+
+          Copilot has attempted **${MAX_COPILOT_RETRIES}** fixes and CI is still failing.
+
+          **Manual intervention is required.** Please review:
+          - The latest [failing CI run](${RUN_URL})
+          - Previous Copilot fix PRs on this branch
+
+          Consider:
+          1. Manually fixing the remaining issues
+          2. Closing this Dependabot PR if the upgrade isn't feasible right now
+          3. Increasing \`MAX_COPILOT_RETRIES\` if Copilot was making progress
+          BODY
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --field body=@/tmp/max_reached_body.md
+
+      # ── Step 5: Fetch CI failure logs ─────────────────────────
+      - name: Fetch failure logs
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        id: logs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          # ── Structured failed-job metadata ──
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --jq '[.jobs[] | select(.conclusion == "failure")
+                   | {name: .name,
+                      steps: [.steps[] | select(.conclusion == "failure") | .name]}]' \
+            > /tmp/failed_jobs.json
+
+          echo "::group::Failed jobs JSON"
+          cat /tmp/failed_jobs.json
+          echo "::endgroup::"
+
+          # ── Error logs from failed jobs (max 4 000 lines total) ──
+          : > /tmp/failure_logs.txt   # truncate
+
+          MAX_TOTAL_LINES=4000
+          MAX_TOTAL_CHARS=30000
+          TOTAL_LINES=0
+          TOTAL_CHARS=0
+          INCLUDED_JOBS=0
+          SKIPPED_JOBS=0
+
+          FAILED_JOBS=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)"')
+
+          if [[ -z "${FAILED_JOBS:-}" ]]; then
+            echo "No failed jobs found for run ${RUN_ID}." > /tmp/failure_logs.txt
+          else
+            while IFS=$'\t' read -r FAILED_JOB_ID FAILED_JOB_NAME; do
+              [[ -z "${FAILED_JOB_ID:-}" ]] && continue
+
+              if ! gh api "repos/${REPO}/actions/jobs/${FAILED_JOB_ID}/logs" > /tmp/failed_job_full.log 2>/dev/null; then
+                continue
+              fi
+
+              # Build job header first so per-job extraction honors global remaining limits.
+              printf -- '--- Job %s (%s) ---\n\n' "${FAILED_JOB_ID}" "${FAILED_JOB_NAME:-unknown}" > /tmp/job_header.txt
+
+              HEADER_LINES=$(wc -l < /tmp/job_header.txt | tr -d ' ')
+              HEADER_CHARS=$(wc -c < /tmp/job_header.txt | tr -d ' ')
+              REMAINING_LINES=$(( MAX_TOTAL_LINES - TOTAL_LINES ))
+              REMAINING_CHARS=$(( MAX_TOTAL_CHARS - TOTAL_CHARS ))
+
+              # If even header cannot fit, stop.
+              if [[ "${HEADER_LINES}" -gt "${REMAINING_LINES}" || "${HEADER_CHARS}" -gt "${REMAINING_CHARS}" ]]; then
+                break
+              fi
+
+              REMAINING_JOB_LINES=$(( REMAINING_LINES - HEADER_LINES ))
+              REMAINING_JOB_CHARS=$(( REMAINING_CHARS - HEADER_CHARS ))
+
+              # Extract complete error blocks for this job only, capped by remaining budget.
+              awk -v max_lines="${REMAINING_JOB_LINES}" -v max_chars="${REMAINING_JOB_CHARS}" '
+                BEGIN {
+                  IGNORECASE=1
+                  in_block=0
+                  block_count=0
+                  found_any=0
+                  included_any=0
+                  total_lines=0
+                  total_chars=0
+                  truncated=0
+                }
+
+                function block_chars(  i, c) {
+                  c=0
+                  for (i = 1; i <= block_count; i++) c += length(block[i]) + 1
+                  return c
+                }
+
+                function flush_block(  i, block_lines, block_chars_count) {
+                  if (block_count == 0) return
+
+                  block_lines = block_count + 1   # +1 for trailing blank separator
+                  block_chars_count = block_chars() + 1
+
+                  if ((total_lines + block_lines) <= max_lines && (total_chars + block_chars_count) <= max_chars) {
+                    for (i = 1; i <= block_count; i++) print block[i]
+                    print ""
+                    total_lines += block_lines
+                    total_chars += block_chars_count
+                    included_any=1
+                  } else {
+                    truncated=1
+                  }
+
+                  delete block
+                  block_count=0
+                }
+
+                {
+                  line = $0
+
+                  if (line ~ /(error|exception|traceback|fatal|failed|failure)/) {
+                    found_any=1
+                    if (!in_block) {
+                      in_block=1
+                      block_count=0
+                    }
+                    block[++block_count] = line
+                    next
+                  }
+
+                  if (in_block) {
+                    if (line ~ /^$/ || line ~ /^##\[group\]/ || line ~ /^##\[endgroup\]/ || line ~ /^\+\s*\w/) {
+                      flush_block()
+                      in_block=0
+                      next
+                    }
+                    block[++block_count] = line
+                    next
+                  }
+                }
+
+                END {
+                  if (in_block) flush_block()
+
+                  if (!found_any) {
+                    print "No error-pattern blocks found for this job."
+                    print ""
+                  } else if (!included_any) {
+                    print "No complete error block could fit within the remaining size budget for this job."
+                    print ""
+                  }
+
+                  if (truncated) {
+                    print "[NOTE] Additional error blocks were omitted to stay within size limits."
+                    print ""
+                  }
+                }
+              ' /tmp/failed_job_full.log > /tmp/job_error_blocks.txt
+
+              {
+                cat /tmp/job_header.txt
+                cat /tmp/job_error_blocks.txt
+              } > /tmp/job_section.txt
+
+              JOB_SECTION_LINES=$(wc -l < /tmp/job_section.txt | tr -d ' ')
+              JOB_SECTION_CHARS=$(wc -c < /tmp/job_section.txt | tr -d ' ')
+              REMAINING_LINES=$(( MAX_TOTAL_LINES - TOTAL_LINES ))
+              REMAINING_CHARS=$(( MAX_TOTAL_CHARS - TOTAL_CHARS ))
+
+              # Section already contains complete blocks only; include if it fits.
+              if [[ "${JOB_SECTION_LINES}" -le "${REMAINING_LINES}" && "${JOB_SECTION_CHARS}" -le "${REMAINING_CHARS}" ]]; then
+                cat /tmp/job_section.txt >> /tmp/failure_logs.txt
+                TOTAL_LINES=$(( TOTAL_LINES + JOB_SECTION_LINES ))
+                TOTAL_CHARS=$(( TOTAL_CHARS + JOB_SECTION_CHARS ))
+                INCLUDED_JOBS=$(( INCLUDED_JOBS + 1 ))
+              else
+                SKIPPED_JOBS=$(( SKIPPED_JOBS + 1 ))
+              fi
+
+              if [[ "${TOTAL_LINES}" -ge "${MAX_TOTAL_LINES}" || "${TOTAL_CHARS}" -ge "${MAX_TOTAL_CHARS}" ]]; then
+                break
+              fi
+            done <<< "${FAILED_JOBS}"
+
+            if [[ "${INCLUDED_JOBS}" -eq 0 ]]; then
+              {
+                echo "No failed-job error sections could be included without exceeding limits (4,000 lines / 30,000 chars)."
+                echo "Only complete error blocks are included (no partial error blocks)."
+              } > /tmp/failure_logs.txt
+            elif [[ "${SKIPPED_JOBS}" -gt 0 ]]; then
+              {
+                echo ""
+                echo "[NOTE] Skipped ${SKIPPED_JOBS} failed job(s) because no complete error blocks fit in the remaining budget."
+              } >> /tmp/failure_logs.txt
+            fi
+          fi
+
+          # ── Expose as outputs via delimiter-safe heredocs ──
+          {
+            echo "failed_jobs<<GHEOF"
+            cat /tmp/failed_jobs.json
+            echo "GHEOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "log_snippet<<GHEOF"
+            cat /tmp/failure_logs.txt
+            echo "GHEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── Step 6: Build & post Copilot trigger comment ──────────
+      #
+      #   SECURITY NOTE: The comment body is written to a file and
+      #   posted via `--field body=@file` so that CI log content can
+      #   never be interpreted as shell code or GitHub expression.
+      # ────────────────────────────────────────────────────────────
+      - name: Build Copilot trigger comment
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${ATTEMPT}" -eq 1 ]]; then
+            HEADER="## 🤖 Copilot: Fix CI Failures (Attempt #${ATTEMPT})"
+            CONTEXT="This is the **first** automated fix attempt."
+          else
+            HEADER="## 🔄 Copilot: Retry Fix CI Failures (Attempt #${ATTEMPT} of ${MAX_COPILOT_RETRIES})"
+            CONTEXT="Previous fix attempts did **not** fully resolve CI. Review what was already tried in earlier comments and PRs on this branch, then fix the **remaining** issues. Do **not** repeat changes that were already applied."
+          fi
+
+          # Read log artifacts produced by the previous step
+          FAILED_JOBS_JSON=$(cat /tmp/failed_jobs.json 2>/dev/null || echo '[]')
+          LOG_TEXT=$(cat /tmp/failure_logs.txt 2>/dev/null || echo 'No logs captured.')
+
+          cat > /tmp/copilot_comment.md <<COMMENT
+          ${COPILOT_MARKER}
+          @copilot
+
+          ${HEADER}
+
+          ${CONTEXT}
+
+          ---
+
+          Please take full ownership of fixing CI by using your **Copilot fix PR** so that all required checks pass.
+
+          ### Goal
+
+          - Analyze the dependency-upgrade context and the **current CI failures** shown above.
+          - Make **all necessary code-level changes** (app code, config, assets, migrations, tests, and CI config if needed) so checks on your Copilot fix PR pass.
+          - Create or update a **Copilot fix PR** that targets the Dependabot branch.
+          - Your Copilot fix PR should be in a state where maintainers can merge it directly.
+
+          ### Latest CI Failure Details
+
+          🔗 **Failing CI run:** ${RUN_URL}
+          📊 **Attempt:** #${ATTEMPT} of ${MAX_COPILOT_RETRIES}
+
+          **Failed jobs:**
+          \`\`\`json
+          ${FAILED_JOBS_JSON}
+          \`\`\`
+
+          **Failure log excerpt (failed jobs, complete error blocks only, max 4,000 lines and ~30,000 chars):**
+          \`\`\`
+          ${LOG_TEXT}
+          \`\`\`
+
+          ### How to work
+
+          **As your very first action**, post a single comment on this PR with the checklist below (copy it exactly).
+          Then **edit that same comment** to check off each item as you complete it, adding a short summary next to the checkbox.
+          If a progress comment with marker ${COPILOT_PROGRESS_MARKER} already exists, **reuse and update that same comment** instead of creating a new one.
+          Do **not** post separate progress comments for each step or each retry — keep everything in one persistent checklist thread.
+          After **every step**, immediately update that same checklist comment with a clear status note (Done / In progress / Blocked + one-line reason).
+          If you intentionally skip a step, check it off and write \`Skipped: <reason>\` next to it.
+
+          \`\`\`markdown
+          ${COPILOT_PROGRESS_MARKER}
+          ### 🤖 Copilot Fix Progress
+
+          - [ ] **Step 1 — Understand the failures:**
+          - [ ] **Step 2 — Plan and apply fixes:**
+          - [ ] **Step 3 — Run targeted tests for failed jobs:**
+          - [ ] **Step 4 — Create the fix PR:**
+          - [ ] **Step 5 — Iterate until green:**
+          - [ ] **Ready to merge ✅**
+          \`\`\`
+
+          #### Step details
+
+          1. **Understand the failures**
+             - Read the failure logs above carefully.
+             - Also check the full CI run at the link above for complete context.
+             - Identify the **exact errors** (e.g., duplicate migrations, Tailwind build errors, failing tests, missing dependencies, schema mismatches, etc.).
+             - ✏️ Status update required: immediately edit your checklist after this step and add a one-line summary of what failed and why.
+
+          2. **Plan and apply fixes**
+             - Update or remove migrations, schema, views, tests, config, or CI steps as needed.
+             - Do **not** downgrade dependencies; keep the requested upgrade versions and adapt the code/config to them.
+             - Keep changes **minimal and focused** only on what is needed to get CI green.
+             - If this is a retry, check what was already changed in previous fix PRs and build on top of those changes.
+             - ✏️ Status update required: immediately edit your checklist after this step and add a one-line summary of the changes you applied.
+
+          3. **Run only targeted tests for failed-job errors**
+             - Use the failed job names and error logs above to identify the exact failing test files/commands.
+             - Run tests from the **Copilot fix PR branch** (the branch you are preparing for review).
+             - Run **only** the tests that correspond to the failures you fixed (and any directly dependent tests needed to validate those fixes).
+             - **Do NOT run the entire test suite** unless the failed job itself is explicitly a full-suite job and there is no narrower command.
+             - Re-run the same targeted tests after each fix until they pass or you hit a hard blocker.
+             - ✏️ Status update required: immediately edit your checklist after this step and add a one-line summary of which failed-job tests were run and their results.
+
+           4. **Create or update the Copilot fix PR**
+             - Open or update your PR **from your Copilot branch into the Dependabot branch**.
+             - Title the PR: \`AI GEM UPGRADE\`
+             - Include a clear description explaining:
+               - What broke and why.
+               - Exactly what files you changed and why those changes fix the CI failures.
+               - What attempt number this is.
+             - Copy the same progress checklist (including marker ${COPILOT_PROGRESS_MARKER}) into the fix PR description and keep it updated there too.
+             - ✏️ Status update required: immediately edit your checklist after this step and add a link to the PR you opened.
+
+          5. **Do not stop on the first failure**
+             - Keep iterating within this session until:
+               - The tests and CI commands you run are passing, **and**
+              - You are confident that the Copilot fix PR is ready to merge.
+             - If you hit a hard blocker you truly cannot solve, explain clearly what is blocking you.
+             - ✏️ Status update required: immediately edit your checklist after this step and add a one-line summary confirming CI is green or explaining the blocker.
+
+          6. **Final sign-off**
+             - Once all steps above are done and CI is passing, check off the last item: **Ready to merge ✅**.
+             - This signals that your fix PR is complete and safe to merge into the Dependabot branch.
+             - When all CI checks pass, automation adds the **"ReadyForReview"** label to your fix PR.
+
+          ---
+          _This comment was auto-generated by the Dependabot CI fix automation (attempt #${ATTEMPT})._
+          COMMENT
+
+      - name: Post Copilot trigger comment
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --field body=@/tmp/copilot_comment.md
+
+          echo "✅ Posted Copilot trigger comment (attempt #${ATTEMPT}) on PR #${PR_NUMBER}"
+
+      # ── Step 7: Label the Dependabot PR ───────────────────────
+      - name: Add label to Dependabot PR
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Ensure the label exists (idempotent)
+          gh api "repos/${REPO}/labels" \
+            --method POST \
+            --field name="copilot-ci-fix-requested" \
+            --field color="1d76db" \
+            --field description="Copilot has been asked to fix CI on this PR" \
+            2>/dev/null || true
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            --method POST \
+            --input - <<< '{"labels":["copilot-ci-fix-requested"]}'
+
+      # ── Step 8: Auto-approve pending Copilot workflows ────────
+      - name: Auto-approve pending workflows on Copilot PRs
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          DEPENDABOT_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RETRY_LABEL: ${{ env.RETRY_LABEL }}
+        run: |
+          set -euo pipefail
+
+          # Only approve runs triggered by trusted bots for the specific CI
+          # workflow. This prevents the PAT from bypassing GitHub's
+          # "Approve and run" gate for untrusted actors or unexpected workflows.
+          TRUSTED_ACTORS='["dependabot[bot]","github-copilot[bot]"]'
+          TRUSTED_WORKFLOWS='["Tests"]'
+
+          echo "🔎 Looking for Copilot PRs targeting Dependabot branch '${DEPENDABOT_BRANCH}' with label '${RETRY_LABEL}'..."
+
+          COPILOT_SHAS=$(gh api "repos/${REPO}/pulls?state=open&base=${DEPENDABOT_BRANCH}" \
+            --jq --arg label "${RETRY_LABEL}" \
+              '[.[] | select(any(.labels[]?; .name == $label)) | .head.sha] | unique | .[]' || true)
+
+          if [[ -z "${COPILOT_SHAS:-}" ]]; then
+            echo "ℹ️  No open Copilot PRs found for Dependabot branch '${DEPENDABOT_BRANCH}'. Nothing to approve."
+            exit 0
+          fi
+
+          ALL_PENDING_RUNS=()
+
+          # Collect pending workflow run IDs for each Copilot PR head SHA
+          while IFS= read -r COPILOT_SHA; do
+            [[ -z "${COPILOT_SHA}" ]] && continue
+            echo "🔎 Finding pending workflow runs for Copilot PR head SHA ${COPILOT_SHA}..."
+            PENDING_FOR_SHA=$(gh api "repos/${REPO}/actions/runs?status=action_required" \
+              --jq --arg sha "${COPILOT_SHA}" \
+                   --argjson actors "${TRUSTED_ACTORS}" \
+                   --argjson workflows "${TRUSTED_WORKFLOWS}" \
+                '[.workflow_runs[]
+                  | select(
+                      .head_sha == $sha and
+                      ($actors | index(.actor.login)) != null and
+                      ($workflows | index(.name)) != null
+                    )
+                  | .id] | .[]' || true)
+
+            if [[ -n "${PENDING_FOR_SHA:-}" ]]; then
+              while IFS= read -r RID; do
+                [[ -z "${RID}" ]] && continue
+                ALL_PENDING_RUNS+=("${RID}")
+              done <<< "${PENDING_FOR_SHA}"
+            fi
+          done <<< "${COPILOT_SHAS}"
+
+          if [[ ${#ALL_PENDING_RUNS[@]} -eq 0 ]]; then
+            echo "ℹ️  No pending workflow runs to approve for Copilot PRs."
+            exit 0
+          fi
+
+          # Deduplicate run IDs before approving
+          mapfile -t UNIQUE_RUNS < <(printf '%s\n' "${ALL_PENDING_RUNS[@]}" | sort -u)
+
+          for RUN_ID in "${UNIQUE_RUNS[@]}"; do
+            echo "✅ Approving workflow run ${RUN_ID}"
+            gh api "repos/${REPO}/actions/runs/${RUN_ID}/approve" --method POST || true
+          done
+
+  label-ready-for-review:
+    # When Tests workflow succeeds on a PR, label Copilot retry PR as ready
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Resolve PR for successful run
+        id: find_pr
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RETRY_LABEL: ${{ env.RETRY_LABEL }}
+        run: |
+          set -euo pipefail
+
+          PR_DATA=$(gh api "repos/${REPO}/pulls" \
+            --method GET \
+            -f head="${REPO%%/*}:${BRANCH}" \
+            -f state=open \
+            --jq '.[0] // empty')
+
+          if [[ -z "${PR_DATA:-}" ]]; then
+            echo "ℹ️  No open PR found for branch ${BRANCH}. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PR_NUMBER=$(echo "${PR_DATA}" | jq -r '.number')
+
+          if echo "${PR_DATA}" | jq -e --arg lbl "${RETRY_LABEL}" 'any(.labels[]?; .name == $lbl)' >/dev/null; then
+            echo "is_copilot_retry=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_copilot_retry=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Add ReadyForReview label
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.find_pr.outputs.is_copilot_retry == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Ensure the label exists (idempotent)
+          gh api "repos/${REPO}/labels" \
+            --method POST \
+            --field name="ReadyForReview" \
+            --field color="0e8a16" \
+            --field description="PR passed tests and is ready for review" \
+            2>/dev/null || true
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            --method POST \
+            --input - <<< '{"labels":["ReadyForReview"]}'
+
+          echo "✅ Added ReadyForReview label to PR #${PR_NUMBER}"
