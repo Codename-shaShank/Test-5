@@ -15,10 +15,13 @@ permissions: {}
 # ──────────────────────────────────────────────────────────────
 env:
   MAX_COPILOT_RETRIES: "5"
+  NO_PROGRESS_LIMIT: "3"
   RETRY_LABEL: "copilot-fix-attempt"
   COPILOT_MARKER: "<!-- copilot-fix-attempt -->"
   COPILOT_PROGRESS_MARKER: "<!-- copilot-fix-progress -->"
+  COPILOT_CONTROLLER_MARKER: "<!-- copilot-controller-state -->"
   MAX_REACHED_MARKER: "<!-- copilot-fix-max-reached -->"
+  NO_PROGRESS_MARKER: "<!-- copilot-fix-no-progress -->"
 
 # ──────────────────────────────────────────────────────────────
 # Prevent parallel runs for the same Dependabot branch
@@ -197,6 +200,7 @@ jobs:
           TOTAL_CHARS=0
           INCLUDED_JOBS=0
           SKIPPED_JOBS=0
+          : > /tmp/error_signatures.txt
 
           FAILED_JOBS=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
             --jq '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)"')
@@ -209,6 +213,13 @@ jobs:
 
               if ! gh api "repos/${REPO}/actions/jobs/${FAILED_JOB_ID}/logs" > /tmp/failed_job_full.log 2>/dev/null; then
                 continue
+              fi
+
+              FIRST_SIG=$(awk 'BEGIN{IGNORECASE=1} /(error|exception|traceback|fatal|failed|failure)/ {print; exit}' /tmp/failed_job_full.log \
+                | sed 's/^[[:space:]]*//' \
+                | cut -c1-240)
+              if [[ -n "${FIRST_SIG:-}" ]]; then
+                echo "${FIRST_SIG}" >> /tmp/error_signatures.txt
               fi
 
               # Build job header first so per-job extraction honors global remaining limits.
@@ -353,13 +364,187 @@ jobs:
             echo "GHEOF"
           } >> "$GITHUB_OUTPUT"
 
+          FAILED_JOB_COUNT=$(jq 'length' /tmp/failed_jobs.json)
+          DISTINCT_SIGNATURE_COUNT=$(sort -u /tmp/error_signatures.txt 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')
+
+          echo "failed_job_count=${FAILED_JOB_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "distinct_error_signature_count=${DISTINCT_SIGNATURE_COUNT}" >> "$GITHUB_OUTPUT"
+
           {
             echo "log_snippet<<GHEOF"
             cat /tmp/failure_logs.txt
             echo "GHEOF"
           } >> "$GITHUB_OUTPUT"
 
-      # ── Step 6: Build & post Copilot trigger comment ──────────
+      # ── Step 6: Controller state + no-progress gate ─────────
+      - name: Evaluate no-progress gate
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        id: progress_gate
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+          CURRENT_FAILED_JOB_COUNT: ${{ steps.logs.outputs.failed_job_count }}
+          CURRENT_DISTINCT_SIGNATURE_COUNT: ${{ steps.logs.outputs.distinct_error_signature_count }}
+        run: |
+          set -euo pipefail
+
+          PREV_STATE_BODY=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq --arg marker "$COPILOT_CONTROLLER_MARKER" '.[] | select(.body | contains($marker)) | .body' \
+            | tail -n1 || true)
+
+          PREV_STATE_JSON=$(printf '%s\n' "${PREV_STATE_BODY}" | awk -v marker="$COPILOT_CONTROLLER_MARKER" '
+            $0 ~ marker {found=1; next}
+            found && NF {print; exit}
+          ')
+
+          if [[ -z "${PREV_STATE_JSON:-}" ]] || ! jq -e . >/dev/null 2>&1 <<< "${PREV_STATE_JSON}"; then
+            PREV_STATE_JSON='{}'
+          fi
+
+          PREV_FAILED=$(jq -r '.last_failed_job_count // empty' <<< "${PREV_STATE_JSON}")
+          PREV_SIGS=$(jq -r '.last_distinct_error_signature_count // empty' <<< "${PREV_STATE_JSON}")
+          PREV_STREAK=$(jq -r '.no_progress_streak // 0' <<< "${PREV_STATE_JSON}")
+          PREV_HALTED=$(jq -r '.halted // false' <<< "${PREV_STATE_JSON}")
+
+          NO_PROGRESS_STREAK=0
+          STATUS="active"
+          HALTED="false"
+          STOP_REASON=""
+
+          if [[ "${PREV_HALTED}" == "true" ]]; then
+            HALTED="true"
+            STATUS="halted"
+            STOP_REASON="automation previously halted"
+            NO_PROGRESS_STREAK="${PREV_STREAK}"
+          elif [[ -z "${PREV_FAILED}" ]]; then
+            NO_PROGRESS_STREAK=0
+          elif [[ "${CURRENT_FAILED_JOB_COUNT}" -lt "${PREV_FAILED}" ]]; then
+            NO_PROGRESS_STREAK=0
+          elif [[ "${CURRENT_FAILED_JOB_COUNT}" -eq "${PREV_FAILED}" && -n "${PREV_SIGS}" && "${CURRENT_DISTINCT_SIGNATURE_COUNT}" -lt "${PREV_SIGS}" ]]; then
+            NO_PROGRESS_STREAK=0
+          else
+            NO_PROGRESS_STREAK=$(( PREV_STREAK + 1 ))
+            if [[ "${NO_PROGRESS_STREAK}" -ge "${NO_PROGRESS_LIMIT}" ]]; then
+              HALTED="true"
+              STATUS="manual_intervention_required"
+              STOP_REASON="no progress across ${NO_PROGRESS_STREAK} consecutive attempts"
+            fi
+          fi
+
+          if [[ "${HALTED}" == "true" ]]; then
+            echo "should_stop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_stop=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "stop_reason=${STOP_REASON}" >> "$GITHUB_OUTPUT"
+
+          STATE_JSON=$(jq -cn \
+            --argjson attempt "${ATTEMPT}" \
+            --argjson failed_job_count "${CURRENT_FAILED_JOB_COUNT}" \
+            --argjson distinct_error_signature_count "${CURRENT_DISTINCT_SIGNATURE_COUNT}" \
+            --argjson no_progress_streak "${NO_PROGRESS_STREAK}" \
+            --arg halted "${HALTED}" \
+            --arg status "${STATUS}" \
+            --arg stop_reason "${STOP_REASON}" \
+            --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              version: 1,
+              attempt: $attempt,
+              last_failed_job_count: $failed_job_count,
+              last_distinct_error_signature_count: $distinct_error_signature_count,
+              no_progress_streak: $no_progress_streak,
+              halted: ($halted == "true"),
+              status: $status,
+              stop_reason: (if $stop_reason == "" then null else $stop_reason end),
+              updated_at: $updated_at
+            }')
+
+          {
+            echo "state_json<<GHEOF"
+            echo "${STATE_JSON}"
+            echo "GHEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Persist controller state comment
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          STATE_JSON: ${{ steps.progress_gate.outputs.state_json }}
+        run: |
+          set -euo pipefail
+
+          STATE_COMMENT_ID=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq --arg marker "$COPILOT_CONTROLLER_MARKER" '.[] | select(.body | contains($marker)) | .id' \
+            | tail -n1 || true)
+
+          cat > /tmp/controller_state_comment.md <<BODY
+          ${COPILOT_CONTROLLER_MARKER}
+          ${STATE_JSON}
+          BODY
+
+          if [[ -n "${STATE_COMMENT_ID:-}" ]]; then
+            gh api "repos/${REPO}/issues/comments/${STATE_COMMENT_ID}" \
+              --method PATCH \
+              --field body=@/tmp/controller_state_comment.md >/dev/null
+            echo "✅ Updated controller state comment (${STATE_COMMENT_ID})"
+          else
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --field body=@/tmp/controller_state_comment.md >/dev/null
+            echo "✅ Created controller state comment"
+          fi
+
+      - name: Post no-progress stop notice
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true' &&
+          steps.progress_gate.outputs.should_stop == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+          FAILED_JOB_COUNT: ${{ steps.logs.outputs.failed_job_count }}
+          STOP_REASON: ${{ steps.progress_gate.outputs.stop_reason }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"$NO_PROGRESS_MARKER\"))] | length" \
+            | paste -sd+ - | bc)
+
+          if [[ "${EXISTING}" -gt 0 ]]; then
+            echo "ℹ️  No-progress stop notice already posted. Skipping duplicate."
+            exit 0
+          fi
+
+          cat > /tmp/no_progress_stop.md <<BODY
+          ${NO_PROGRESS_MARKER}
+          ## 🛑 Manual intervention required (no progress across attempts)
+
+          Automation is stopping because CI failure count is not improving.
+
+          - Attempt: #${ATTEMPT}
+          - Current failed job count: ${FAILED_JOB_COUNT}
+          - Reason: ${STOP_REASON}
+          - Latest failing run: ${RUN_URL}
+
+          Please fix manually before re-enabling automated retries.
+          BODY
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --field body=@/tmp/no_progress_stop.md
+
+      # ── Step 7: Build & post Copilot trigger comment ──────────
       #
       #   SECURITY NOTE: The comment body is written to a file and
       #   posted via `--field body=@file` so that CI log content can
@@ -368,7 +553,8 @@ jobs:
       - name: Build Copilot trigger comment
         if: >-
           steps.find_pr.outputs.skip != 'true' &&
-          steps.check_limit.outputs.exceeded != 'true'
+          steps.check_limit.outputs.exceeded != 'true' &&
+          steps.progress_gate.outputs.should_stop != 'true'
         env:
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           ATTEMPT: ${{ steps.count.outputs.attempt }}
@@ -402,7 +588,7 @@ jobs:
           ### Goal
 
           - Analyze the dependency-upgrade context and the **current CI failures** shown above.
-          - Make **all necessary code-level changes** (app code, config, assets, migrations, tests, and CI config if needed) so checks on your Copilot fix PR pass.
+          - Make the minimal code-level changes needed so that this attempt’s failing jobs (listed below) pass. Do not try to fix unrelated jobs or introduce new checks
           - Create or update a **Copilot fix PR** that targets the Dependabot branch.
           - Your Copilot fix PR should be in a state where maintainers can merge it directly.
 
@@ -475,17 +661,16 @@ jobs:
              - Copy the same progress checklist (including marker ${COPILOT_PROGRESS_MARKER}) into the fix PR description and keep it updated there too.
              - ✏️ Status update required: immediately edit your checklist after this step and add a link to the PR you opened.
 
-          5. **Do not stop on the first failure**
+          5. **You are only responsible for the jobs that were failing in this attempt. If other jobs are still failing, leave them and explain in your checklist comment.**
              - Keep iterating within this session until:
                - The tests and CI commands you run are passing, **and**
-              - You are confident that the Copilot fix PR is ready to merge.
+               - You are confident that merging your PR into this branch will let the GitHub CI checks pass as well.
              - If you hit a hard blocker you truly cannot solve, explain clearly what is blocking you.
              - ✏️ Status update required: immediately edit your checklist after this step and add a one-line summary confirming CI is green or explaining the blocker.
 
           6. **Final sign-off**
              - Once all steps above are done and CI is passing, check off the last item: **Ready to merge ✅**.
              - This signals that your fix PR is complete and safe to merge into the Dependabot branch.
-             - When all CI checks pass, automation adds the **"ReadyForReview"** label to your fix PR.
 
           ---
           _This comment was auto-generated by the Dependabot CI fix automation (attempt #${ATTEMPT})._
@@ -494,7 +679,8 @@ jobs:
       - name: Post Copilot trigger comment
         if: >-
           steps.find_pr.outputs.skip != 'true' &&
-          steps.check_limit.outputs.exceeded != 'true'
+          steps.check_limit.outputs.exceeded != 'true' &&
+          steps.progress_gate.outputs.should_stop != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
@@ -512,7 +698,8 @@ jobs:
       - name: Add label to Dependabot PR
         if: >-
           steps.find_pr.outputs.skip != 'true' &&
-          steps.check_limit.outputs.exceeded != 'true'
+          steps.check_limit.outputs.exceeded != 'true' &&
+          steps.progress_gate.outputs.should_stop != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
@@ -536,7 +723,8 @@ jobs:
       - name: Auto-approve pending workflows on Copilot PRs
         if: >-
           steps.find_pr.outputs.skip != 'true' &&
-          steps.check_limit.outputs.exceeded != 'true'
+          steps.check_limit.outputs.exceeded != 'true' &&
+          steps.progress_gate.outputs.should_stop != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
