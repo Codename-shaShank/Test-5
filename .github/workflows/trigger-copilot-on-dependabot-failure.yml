@@ -410,6 +410,9 @@ jobs:
           PREV_STREAK=$(jq -r '.no_progress_streak // 0' <<< "${PREV_STATE_JSON}")
           PREV_HALTED=$(jq -r '.halted // false' <<< "${PREV_STATE_JSON}")
 
+          echo "prev_failed_job_count=${PREV_FAILED}" >> "$GITHUB_OUTPUT"
+          echo "prev_distinct_error_signature_count=${PREV_SIGS}" >> "$GITHUB_OUTPUT"
+
           NO_PROGRESS_STREAK=0
           STATUS="active"
           HALTED="false"
@@ -441,6 +444,7 @@ jobs:
             echo "should_stop=false" >> "$GITHUB_OUTPUT"
           fi
 
+          echo "no_progress_streak=${NO_PROGRESS_STREAK}" >> "$GITHUB_OUTPUT"
           echo "stop_reason=${STOP_REASON}" >> "$GITHUB_OUTPUT"
 
           STATE_JSON=$(jq -cn \
@@ -558,6 +562,11 @@ jobs:
         env:
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           ATTEMPT: ${{ steps.count.outputs.attempt }}
+          CURRENT_FAILED_JOB_COUNT: ${{ steps.logs.outputs.failed_job_count }}
+          CURRENT_DISTINCT_SIGNATURE_COUNT: ${{ steps.logs.outputs.distinct_error_signature_count }}
+          PREV_FAILED_JOB_COUNT: ${{ steps.progress_gate.outputs.prev_failed_job_count }}
+          PREV_DISTINCT_SIGNATURE_COUNT: ${{ steps.progress_gate.outputs.prev_distinct_error_signature_count }}
+          NO_PROGRESS_STREAK: ${{ steps.progress_gate.outputs.no_progress_streak }}
         run: |
           set -euo pipefail
 
@@ -596,6 +605,11 @@ jobs:
 
           🔗 **Failing CI run:** ${RUN_URL}
           📊 **Attempt:** #${ATTEMPT} of ${MAX_COPILOT_RETRIES}
+          📉 **Current failed job count:** ${CURRENT_FAILED_JOB_COUNT}
+          🧩 **Current distinct error signatures:** ${CURRENT_DISTINCT_SIGNATURE_COUNT}
+          📌 **Previous failed job count:** ${PREV_FAILED_JOB_COUNT:-N/A}
+          📌 **Previous distinct error signatures:** ${PREV_DISTINCT_SIGNATURE_COUNT:-N/A}
+          🔁 **No-progress streak:** ${NO_PROGRESS_STREAK}/${NO_PROGRESS_LIMIT}
 
           **Failed jobs:**
           \`\`\`json
